@@ -1,0 +1,297 @@
+# Fork-only exact-ref validation. This file is intentionally not sent upstream.
+name: tessera fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tessera-osc-manual-${{ github.repository }}-${{ inputs.target_ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep the optimized test profile and its assertions; omit debug symbols in CI.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/tessera
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Report checked-out SHA
+        run: |
+          printf 'checked-out SHA: %s\n' "$(git rev-parse HEAD)"
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          # rust-cache fingerprints every installed toolchain, including the runner image stable.
+          rustup default "$channel"
+          rustup toolchain uninstall stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            verifier -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          (cd verifier && cargo fmt --all --check)
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          (cd verifier && cargo clippy --workspace --all-targets --locked -- -D warnings)
+      # Invoke xtask directly so reviewed repository configuration cannot rewrite the cargo alias.
+      - name: Repository policies
+        run: cargo run --locked --quiet -p xtask -- lint
+      - name: Verifier isolation (RFC-0001)
+        run: cargo run --locked --quiet -p xtask -- check-isolation
+      - name: Test-only features fail release builds (RFC-0001)
+        run: cargo run --locked --quiet -p xtask -- check-test-features
+      - name: Field operations compile branch-free on x86_64 (INV-ARCH-2)
+        run: cargo run --locked --quiet -p xtask -- check-branchless
+
+  rust:
+    name: rust (${{ matrix.workspace }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      matrix:
+        workspace: [prover, verifier]
+    defaults:
+      run:
+        working-directory: ${{ matrix.workspace == 'prover' && '.' || 'verifier' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/tessera
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+      - name: Report checked-out SHA
+        run: |
+          printf 'checked-out SHA: %s\n' "$(git rev-parse HEAD)"
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          # rust-cache fingerprints every installed toolchain, including the runner image stable.
+          rustup default "$channel"
+          rustup toolchain uninstall stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ matrix.workspace == 'prover' && '.' || 'verifier' }} -> target
+          key: ${{ matrix.workspace }}
+          cache-workspace-crates: true
+      - name: Install Nextest 0.9.148 (release binary, SHA-256 pinned)
+        run: |
+          archive=cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$archive" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/$archive"
+          echo "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$HOME/.cargo/bin" cargo-nextest
+      - name: Runtime library unit tests
+        if: matrix.workspace == 'prover'
+        run: cargo nextest run --workspace --exclude xtask --exclude tessera-bench --lib --locked
+      - name: Build the real exact-mode CLI pair
+        if: matrix.workspace == 'prover'
+        run: |
+          cargo build -p tessera-cli --locked
+          (cd verifier && cargo build -p tv-cli --features tv-core/test-params --locked)
+          echo "TESSERA_BIN=$PWD/target/debug/tessera" >> "$GITHUB_ENV"
+          echo "TESSERA_VERIFY_BIN=$PWD/verifier/target/debug/tessera-verify" >> "$GITHUB_ENV"
+      - name: Protocol, proof components and tiny-model integration
+        if: matrix.workspace == 'prover'
+        run: >-
+          cargo nextest run --locked --tests -E 'kind(test)'
+          -p tessera-codec -p tessera-field -p tessera-hash
+          -p tessera-protocol -p tessera-prover -p tessera-e2e
+      - name: Accept real CPU proofs in NI and fresh Live sessions
+        if: matrix.workspace == 'prover'
+        run: >-
+          cargo nextest run --locked -p tessera-prover --test model_leaf
+          --features test-rng,tv-core/test-params -E 'test(complete_runtime_cpu_proofs) | test(public_cpu_api)'
+      - name: Independent verifier tests in parallel
+        if: matrix.workspace == 'verifier'
+        run: cargo nextest run --workspace --lib --tests --locked
+      - name: Independent CLI accepts the real CPU proof and rejects tampering
+        if: matrix.workspace == 'prover'
+        run: |
+          cargo test -p tessera-prover --test model_leaf --features test-rng,tv-core/test-params --locked public_cli_binary -- --ignored
+      - name: Test-parameter unit and claim validation coverage
+        if: matrix.workspace == 'verifier'
+        run: cargo nextest run -p tv-core --features test-params --lib --test claims_validation --locked
+
+  # SC-4 (07 §4): every mutation of a valid tiny proof yields its predeclared verdict.
+  tamper:
+    name: tamper corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/tessera
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+      - name: Report checked-out SHA
+        run: |
+          printf 'checked-out SHA: %s\n' "$(git rev-parse HEAD)"
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          # rust-cache fingerprints every installed toolchain, including the runner image stable.
+          rustup default "$channel"
+          rustup toolchain uninstall stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            verifier -> target
+          key: tamper
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: The independent oracle reproduces the corpus
+        run: python3 -I -B spec/vectors/tamper/generate.py --check
+      # The workspace Clippy step builds no test-only features, so these targets are linted here.
+      - name: Clippy, with the test-only features the corpus needs
+        run: |
+          cargo clippy --locked -p tessera-e2e --features tamper --all-targets -- -D warnings
+          (cd verifier && cargo clippy --locked -p tv-core --features test-params --all-targets -- -D warnings)
+      - name: The base proofs regenerate byte for byte; NI cases through the public verifier API
+        run: cargo test --locked -p tessera-e2e --features tamper --test tamper_corpus --example tamper-base
+      - name: Every case, NI and recorded Live, against the independent verifier
+        working-directory: verifier
+        run: cargo test --locked -p tv-core --features test-params --lib driver::corpus
+
+  # OBS-5 (05 §6): identical runs write identical manifests, with the masks pinned (test-rng).
+  manifest:
+    name: run manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/tessera
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+      - name: Report checked-out SHA
+        run: |
+          printf 'checked-out SHA: %s\n' "$(git rev-parse HEAD)"
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          # rust-cache fingerprints every installed toolchain, including the runner image stable.
+          rustup default "$channel"
+          rustup toolchain uninstall stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+          key: manifest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The workspace Clippy step builds no test-only features, so this target is linted here.
+      - name: Clippy, with the test-only feature
+        run: cargo clippy --locked -p tessera-cli --features test-rng --all-targets -- -D warnings
+      - name: Identical runs write identical manifests; every manifest follows its schema
+        run: cargo test --locked -p tessera-cli --features test-rng --test run_manifest
+
+  test:
+    name: test
+    needs: [checks, rust, tamper, manifest]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Both workspaces, the tamper corpus and the run manifest passed, or only documentation changed
+        env:
+          CHECKS: ${{ needs.checks.result }}
+          RESULT: ${{ needs.rust.result }}
+          TAMPER: ${{ needs.tamper.result }}
+          MANIFEST: ${{ needs.manifest.result }}
+        run: |
+          test "$CHECKS" = "success"
+          test "$RESULT" = "success"
+          test "$TAMPER" = "success"
+          test "$MANIFEST" = "success"
+
+  python:
+    name: python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/tessera
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+      - name: Report checked-out SHA
+        run: |
+          printf 'checked-out SHA: %s\n' "$(git rev-parse HEAD)"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.9.18"
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+      - name: Install from the lockfile, with CPU PyTorch (RFC-0005 'Python packaging')
+        run: uv sync --locked --extra cpu
+      - name: Lint
+        run: |
+          uv run --no-sync ruff check
+          uv run --no-sync ruff format --check
+      - name: Type-check (strict, from pyproject.toml)
+        run: uv run --no-sync pyright
+      - name: Test
+        run: uv run --no-sync pytest
+
+  constraint-digest:
+    name: constraint-digest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/tessera
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+      - name: Report checked-out SHA
+        run: |
+          printf 'checked-out SHA: %s\n' "$(git rev-parse HEAD)"
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          # rust-cache fingerprints every installed toolchain, including the runner image stable.
+          rustup default "$channel"
+          rustup toolchain uninstall stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Independent constraint-system digest conformance (RFC-0007)
+        run: |
+          cargo test -p tessera-e2e --example constraint-digest --locked
+          cargo run -p tessera-e2e --example constraint-digest --locked -- --model tiny-2-servable --n 1
